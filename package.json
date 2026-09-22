@@ -20,8 +20,9 @@
   },
   "main": "index.js",
   "scripts": {
-    "build": "tsc",
-    "dev": "tsc --watch",
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "typecheck": "tsc --noEmit",
     "clean": "rimraf dist",
     "prepublishOnly": "npm run build",
     "test": "vitest run",
@@ -42,7 +43,7 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.26.0",
-    "zod": "^3.23.8"
+    "zod": "^3.25.0"
   },
   "peerDependencies": {
     "n8n-workflow": "*"
@@ -51,6 +52,7 @@
     "@types/node": "^26.6.2",
     "n8n-workflow": "^1.120.0",
     "rimraf": "^6.0.1",
+    "tsup": "^8.3.0",
     "typescript": "^5.5.4",
     "vitest": "^2.1.1"
   }
