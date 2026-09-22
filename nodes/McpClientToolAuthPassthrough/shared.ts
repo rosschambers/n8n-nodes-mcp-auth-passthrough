@@ -1,5 +1,6 @@
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
+import { NodeOperationError } from 'n8n-workflow';
 import type { ISupplyDataFunctions } from 'n8n-workflow';
 
 /**
@@ -13,11 +14,8 @@ export type McpServerTransport = 'httpStreamable' | 'sse';
 
 /**
  * Supported authentication modes for the node's `authentication` parameter.
- *
- * TASK 2: add `'authPassthrough'` to this union once the per-item token
- * expression parameter is implemented.
  */
-export type McpAuthenticationMode = 'none' | 'bearerAuth';
+export type McpAuthenticationMode = 'none' | 'bearerAuth' | 'authPassthrough';
 
 export interface McpNodeConfig {
 	authentication: McpAuthenticationMode;
@@ -63,15 +61,10 @@ export async function getNodeConfig(
  * Resolves the HTTP headers to send with every MCP request, based on the
  * node's `authentication` mode.
  *
- * `itemIndex` is threaded through now, even though only `none` and
- * `bearerAuth` are implemented, because TASK 2's `authPassthrough` case
- * needs it to resolve a per-item expression parameter (for example
- * `Bearer {{ $json.token }}`) via `context.getNodeParameter(..., itemIndex)`.
- *
- * TASK 2: add a case for `'authPassthrough'` here that reads a new
- * `authPassthroughHeaderValue` (or similarly named) string parameter with
- * expression support, resolved per-item via `itemIndex`, and returns it
- * verbatim (or wrapped as `Bearer <token>`) as the `Authorization` header.
+ * `itemIndex` is threaded through so the `authPassthrough` case can resolve
+ * a per-item expression parameter (for example
+ * `Bearer {{ $('Token Refresh').item.json.accessToken }}`) via
+ * `context.getNodeParameter(..., itemIndex)`.
  */
 export async function getAuthHeaders(
 	context: ISupplyDataFunctions,
@@ -91,7 +84,16 @@ export async function getAuthHeaders(
 			}
 			return { headers: { Authorization: `Bearer ${credentials.token}` } };
 		}
-		// TASK 2: case 'authPassthrough': { ... }
+		case 'authPassthrough': {
+			const token = context.getNodeParameter('authPassthroughToken', itemIndex, '') as string;
+			if (!token || token.trim() === '') {
+				throw new NodeOperationError(
+					context.getNode(),
+					'Auth Passthrough token is empty. Provide an expression that resolves to the bearer token.',
+				);
+			}
+			return { headers: { Authorization: `Bearer ${token}` } };
+		}
 		default: {
 			return { headers: {} };
 		}

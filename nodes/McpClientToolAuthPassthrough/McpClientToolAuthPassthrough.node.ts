@@ -112,15 +112,30 @@ export class McpClientToolAuthPassthrough implements INodeType {
 						name: 'Bearer Auth',
 						value: 'bearerAuth',
 					},
-					// TASK 2: add { name: 'Auth Passthrough (Expression)', value: 'authPassthrough' } here.
+					{
+						name: 'Auth Passthrough (Expression)',
+						value: 'authPassthrough',
+					},
 				],
 				default: 'none',
 				description: 'The way to authenticate with the MCP server',
 			},
-			// TASK 2: add an `authPassthroughHeaderValue` (or similarly named) string
-			// parameter here, with `displayOptions.show.authentication: ['authPassthrough']`
-			// and expression support enabled, for example a default of
-			// `=Bearer {{ $json.token }}`.
+			{
+				displayName: 'Bearer Token (Expression)',
+				name: 'authPassthroughToken',
+				type: 'string',
+				typeOptions: {
+					password: true,
+				},
+				default: '',
+				description:
+					'An expression that resolves to the bearer token to send with each request, for example {{ $(\'Token Refresh\').item.json.accessToken }}. Resolved per item at execution time instead of coming from a static credential.',
+				displayOptions: {
+					show: {
+						authentication: ['authPassthrough'],
+					},
+				},
+			},
 			{
 				displayName: 'Options',
 				name: 'options',
