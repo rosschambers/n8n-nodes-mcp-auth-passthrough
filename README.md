@@ -54,6 +54,25 @@ loads the host n8n's own modules and calls them:
 The ONLY behavioural difference from the stock node is `getAuthHeaders` in
 `shared.ts`, which adds the `authPassthrough` expression-token mode.
 
+### Node classification: a native AI sub-node, NOT `usableAsTool`
+
+The `description` mirrors the stock McpClientTool's classification: `group: ['output']`,
+`inputs: []`, `outputs: [{ type: AiTool, displayName: 'Tools' }]`, a `supplyData`
+method and NO `execute` method. Crucially it must **not** set `usableAsTool`.
+
+`usableAsTool` is for regular ACTION nodes (with an `execute` method) that you also
+want exposed as a tool: at load time n8n's `convertNodeToAiTool` auto-generates a
+separate `<name>Tool` wrapper, and the agent drives that wrapper's tool through
+`createNodeAsTool` → the node's `execute`. A node that provides tools via
+`supplyData` and has no `execute` must not use that path. If it does, when the agent
+invokes the tool n8n calls `runNode` on it and throws
+`The node "..." has a "supplyData" method but no "execute" method`
+(n8n-core `workflow-execute` runNode). Dropping `usableAsTool` makes this a pure
+supplyData tool provider — the agent routes tool calls through the toolkit
+`supplyData` returns, and `runNode` is never called. The workflow references the node
+by its base type (`mcpClientToolAuthPassthrough`), exactly like the stock node; there
+is no `*Tool` variant to point at.
+
 ### Why reuse instead of reimplement — identity, and the `strict` crash
 
 The AI Agent (ToolsAgent) binds each tool to the model with LangChain's

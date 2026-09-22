@@ -13,7 +13,20 @@ export class McpClientToolAuthPassthrough implements INodeType {
 		displayName: 'MCP Client Tool (Auth Passthrough)',
 		name: 'mcpClientToolAuthPassthrough',
 		icon: 'fa:plug',
-		group: ['transform'],
+		// A native AI sub-node (a tool PROVIDER), exactly like the stock
+		// McpClientTool: group 'output', a single AiTool output, and a
+		// `supplyData` method that hands tools to the agent. It must NOT set
+		// `usableAsTool` — that flag is for regular ACTION nodes you also want
+		// exposed as a tool, and it makes n8n auto-generate a `<name>Tool`
+		// action-wrapper (via convertNodeToAiTool) whose tool is driven through
+		// `createNodeAsTool` -> the node's `execute` method. Because this node has
+		// `supplyData` and NO `execute`, that path throws
+		// `The node "..." has a "supplyData" method but no "execute" method`
+		// (n8n-core workflow-execute runNode) when the agent invokes the tool.
+		// Removing `usableAsTool` makes this a pure supplyData tool provider, and
+		// the agent routes tool calls through the toolkit supplyData returns —
+		// never runNode. See README ("AI sub-node classification").
+		group: ['output'],
 		version: 1,
 		description:
 			'Connects to a Model Context Protocol server and exposes its tools to an AI agent, with support for resolving the bearer token from a per-item expression instead of a static credential.',
@@ -27,9 +40,7 @@ export class McpClientToolAuthPassthrough implements INodeType {
 			},
 		},
 		inputs: [],
-		outputs: [NodeConnectionTypes.AiTool],
-		outputNames: ['Tool'],
-		usableAsTool: true,
+		outputs: [{ type: NodeConnectionTypes.AiTool, displayName: 'Tools' }],
 		credentials: [
 			{
 				name: 'httpBearerAuth',
