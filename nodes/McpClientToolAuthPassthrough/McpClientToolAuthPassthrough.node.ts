@@ -1,4 +1,4 @@
-import { NodeConnectionTypes } from 'n8n-workflow';
+import { NodeConnectionTypes, NodeOperationError } from 'n8n-workflow';
 import type {
 	INodeType,
 	INodeTypeDescription,
@@ -6,38 +6,7 @@ import type {
 	SupplyData,
 } from 'n8n-workflow';
 
-import { connectMcpClient, getAuthHeaders, getNodeConfig } from './shared';
-
-/**
- * A minimal wrapper around a single MCP tool, shaped so it can later be
- * adapted into a LangChain `StructuredTool` (or any other agent-tool
- * interface) without changing how it is produced here.
- *
- * TASK 2 note: this stub intentionally stays framework-agnostic. Swap the
- * `invoke` implementation, or wrap instances of this class in a LangChain
- * `DynamicStructuredTool`, once the full toolkit wiring is added.
- */
-export class McpToolStub {
-	public readonly name: string;
-
-	public readonly description: string;
-
-	private readonly callTool: (args: Record<string, unknown>) => Promise<unknown>;
-
-	constructor(
-		name: string,
-		description: string,
-		callTool: (args: Record<string, unknown>) => Promise<unknown>,
-	) {
-		this.name = name;
-		this.description = description;
-		this.callTool = callTool;
-	}
-
-	public async invoke(args: Record<string, unknown>): Promise<unknown> {
-		return this.callTool(args);
-	}
-}
+import { getAuthHeaders, getNodeConfig, resolveHostMcpMachinery } from './shared';
 
 export class McpClientToolAuthPassthrough implements INodeType {
 	description: INodeTypeDescription = {
@@ -156,34 +125,75 @@ export class McpClientToolAuthPassthrough implements INodeType {
 	};
 
 	async supplyData(this: ISupplyDataFunctions, itemIndex: number): Promise<SupplyData> {
-		const config = await getNodeConfig(this, itemIndex);
+		const node = this.getNode();
+		const config = getNodeConfig(this, itemIndex);
+
+		// Reuse the HOST n8n's own MCP machinery so the tools we return are the
+		// exact classes the ToolsAgent expects (host DynamicStructuredTool +
+		// StructuredToolkit). Only the auth headers differ from the stock node.
+		const host = resolveHostMcpMachinery(this);
+
 		const { headers } = await getAuthHeaders(this, config.authentication, itemIndex);
 
-		const { client, close } = await connectMcpClient({
+		const connection = await host.connectMcpClient({
 			serverTransport: config.serverTransport,
 			endpointUrl: config.endpointUrl,
 			headers,
-			name: 'n8n-mcp-client-tool-auth-passthrough',
-			version: '0.1.0',
-			timeout: config.timeout,
+			name: node.type,
+			version: node.typeVersion,
 		});
 
-		const { tools } = await client.listTools();
-
-		// TASK 2 leaves this wrapping minimal on purpose: each MCP tool is
-		// exposed as a framework-agnostic `McpToolStub`. Replace this with the
-		// full LangChain `DynamicStructuredTool` wiring (JSON schema to Zod
-		// conversion, output parsing, etc.) once the auth-passthrough mode is
-		// implemented and needs to be exercised end to end.
-		const wrappedTools = tools.map((tool) => {
-			return new McpToolStub(tool.name, tool.description ?? '', async (args) => {
-				return client.callTool({ name: tool.name, arguments: args });
+		if (!connection.ok) {
+			this.logger.error('McpClientToolAuthPassthrough: Failed to connect to MCP Server', {
+				error: connection.error,
 			});
-		});
+			const mappedError = host.mapToNodeOperationError(node, connection.error);
+			this.addOutputData(NodeConnectionTypes.AiTool, itemIndex, mappedError);
+			throw mappedError;
+		}
+
+		const client = connection.result;
+		const mcpTools = await host.getAllTools(client);
+
+		if (!mcpTools?.length) {
+			const emptyError = new NodeOperationError(node, 'MCP Server returned no tools', {
+				itemIndex,
+				description:
+					'Connected successfully to your MCP server but it returned an empty list of tools.',
+			});
+			this.addOutputData(NodeConnectionTypes.AiTool, itemIndex, emptyError);
+			throw emptyError;
+		}
+
+		// Mirror the stock supplyData tool-wrapping EXACTLY: each MCP tool becomes
+		// a host DynamicStructuredTool (with a real zod schema, so it passes
+		// LangChain's isLangChainTool / the `strict` setter), wrapped by the host
+		// logWrapper, then collected into the host StructuredToolkit so
+		// n8n-core's `getConnectedTools` recognises and unwraps it.
+		const tools = mcpTools.map((tool) =>
+			host.logWrapper(
+				host.mcpToolToDynamicTool(
+					tool,
+					host.createCallTool(tool.name, client, config.timeout, (errorMessage) => {
+						const error = new NodeOperationError(node, errorMessage, { itemIndex });
+						void this.addOutputData(NodeConnectionTypes.AiTool, itemIndex, error);
+						this.logger.error(
+							`McpClientToolAuthPassthrough: Tool "${tool.name}" failed to execute`,
+							{ error },
+						);
+					}),
+				),
+				this,
+			),
+		);
+
+		const toolkit = new host.StructuredToolkit(tools);
 
 		return {
-			response: wrappedTools,
-			closeFunction: close,
+			response: toolkit,
+			closeFunction: async () => {
+				await (client as { close: () => Promise<void> }).close();
+			},
 		};
 	}
 }

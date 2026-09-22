@@ -3,31 +3,35 @@ import { defineConfig } from 'tsup';
 /**
  * Bundle the node into a SINGLE self-contained CommonJS file.
  *
- * Why this exists (do not revert to plain `tsc`):
+ * Two distinct reasons this config looks the way it does:
  *
- * n8n loads packages pointed at by N8N_CUSTOM_EXTENSIONS with its
- * CustomDirectoryLoader, which runs `fast-glob('**\/*.node.js', { cwd:
- * <extension dir> })` — a RECURSIVE glob with no node_modules exclusion. For
- * every match it derives a class name from the filename (the part before the
- * first dot) and executes, inside a vm sandbox,
- * `new (require('<file>').<ClassName>)()`.
+ * 1. WHY BUNDLE AT ALL (do not revert to plain `tsc` + a vendored node_modules)
  *
- * @modelcontextprotocol/sdk pulls in `pkce-challenge`, whose Node build is
- * named `dist/index.node.js`. When our runtime deps live in a vendored
- * node_modules next to the mounted node, that file matches the glob. n8n then
- * treats it as a node: className becomes `index` (from `index.node.js`), it
- * require()s the file (Node 24 CAN require an ESM module and returns a
- * namespace object), finds no `.index` export, and `new undefined()` throws
- * `TypeError: require(...).index is not a constructor`. There is no try/catch
- * around this in the custom-extension path, so it crash-loops the whole n8n
- * process.
+ *    n8n loads packages pointed at by N8N_CUSTOM_EXTENSIONS with its
+ *    CustomDirectoryLoader, which runs `fast-glob('**\/*.node.js', { cwd:
+ *    <extension dir> })` — a RECURSIVE glob with no node_modules exclusion. For
+ *    every match it derives a class name from the filename and executes, in a
+ *    vm sandbox, `new (require('<file>').<ClassName>)()`. A vendored dependency
+ *    that ships a `*.node.js` file (pkce-challenge ships `dist/index.node.js`)
+ *    is then loaded as a bogus node and crash-loops the whole n8n process. A
+ *    single bundled file with NO shipped node_modules removes that surface.
+ *    See README.md ("n8n loader caveat").
  *
- * Bundling everything into one CJS file means there is NO separate
- * pkce-challenge module on disk to be globbed or required — the ESM source is
- * transpiled and inlined. The only `*.node.js` file under the mounted
- * directory becomes our real node, whose class name matches.
+ * 2. WHY (ALMOST) EVERYTHING IS EXTERNAL — identity with the host
  *
- * See README.md ("n8n loader caveat") for the full write-up.
+ *    This node does NOT bundle the MCP SDK. Instead its supplyData reuses the
+ *    HOST n8n's OWN @n8n/n8n-nodes-langchain MCP machinery (connectMcpClient,
+ *    mcpToolToDynamicTool, createCallTool), the host @n8n/ai-utilities
+ *    (logWrapper), the host n8n-core (StructuredToolkit) and the host
+ *    @langchain/core, so the tools it returns are the EXACT classes the
+ *    ToolsAgent expects. If we bundled our own copies, LangChain's
+ *    `convertToOpenAITool` would not recognise our tool (isLangChainTool ->
+ *    false) and crash with "Cannot set properties of undefined (setting
+ *    'strict')", and n8n-core's `getConnectedTools` would fail its
+ *    `instanceof StructuredToolkit` check. Those modules are therefore marked
+ *    EXTERNAL and resolved from the host at runtime (the deploy adds
+ *    /usr/local/lib/node_modules/n8n/node_modules to NODE_PATH). We only bundle
+ *    our own small source; there are no runtime dependencies left to inline.
  */
 export default defineConfig({
 	entry: {
@@ -47,14 +51,16 @@ export default defineConfig({
 	dts: false,
 	clean: true,
 	outDir: 'dist',
-	// Keep n8n-workflow EXTERNAL: the host container provides it, and n8n
-	// inspects some of its exports (NodeConnectionTypes, NodeOperationError) by
-	// identity — bundling our own copy would break those checks.
-	external: ['n8n-workflow'],
-	// tsup externalizes everything listed in `dependencies` / `peerDependencies`
-	// by DEFAULT. That is the trap: without this, the MCP SDK stays a bare
-	// `require`, the vendored node_modules (with pkce-challenge's index.node.js)
-	// has to ship, and the crash returns. Force the runtime libraries to be
-	// INLINED so nothing but n8n-workflow is required at runtime.
-	noExternal: [/@modelcontextprotocol\/sdk/, /^zod/, /pkce-challenge/],
+	// Everything the node touches at runtime is provided by the HOST n8n and
+	// must be the host's own instances (see reason 2 above). Keep them external;
+	// they resolve from the host node_modules via NODE_PATH. The stock MCP
+	// helpers are loaded dynamically by absolute path in shared.ts, so they do
+	// not appear here.
+	external: [
+		'n8n-workflow',
+		'n8n-core',
+		'@langchain/core',
+		'@n8n/ai-utilities',
+		'@n8n/n8n-nodes-langchain',
+	],
 });

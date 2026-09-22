@@ -15,31 +15,75 @@ resolved fresh for every item the node processes.
 
 ## Status
 
-This package currently ships the MCP connection scaffold (endpoint configuration,
-transport selection, tool listing) with `none` and `bearerAuth` (static credential)
-authentication modes implemented. The `authPassthrough` mode — where the header value
-is resolved from a per-item expression such as:
+Implemented and working end to end: the node connects to an MCP server, lists its
+tools, and exposes them to the AI Agent as LangChain tools. All three authentication
+modes work — `none`, `bearerAuth` (static credential), and `authPassthrough`, where
+the header value is resolved from a per-item expression such as:
 
 ```
-Bearer {{ $json.token }}
+{{ $json.token }}
 ```
 
-— is being added next. See `nodes/McpClientToolAuthPassthrough/shared.ts` for the
-exact spot marked `TASK 2` where the new authentication case and its token parameter
-will be implemented.
+resolved fresh for every item.
 
 ## Node
 
 **MCP Client Tool (Auth Passthrough)** (`mcpClientToolAuthPassthrough`)
 
 - **Endpoint URL** — the MCP server's URL. Supports expressions.
-- **Server Transport** — `httpStreamable` (implemented) or `sse` (reserved).
+- **Server Transport** — `httpStreamable` or `sse` (both handled by the host MCP
+  transport code — see Architecture).
 - **Authentication** — `None`, `Bearer Auth` (uses n8n's built-in HTTP Bearer Auth
-  credential), and soon `Auth Passthrough (Expression)`.
+  credential), or `Auth Passthrough (Expression)`.
 - **Options → Timeout** — request timeout in milliseconds.
 
 The node connects to the configured MCP server, lists its available tools, and
 exposes them on the node's `AI Tool` output for use by an AI agent.
+
+## Architecture: it reuses the HOST n8n's MCP machinery (this is deliberate)
+
+`supplyData` does NOT bundle or reimplement the MCP tool wrapping. At runtime it
+loads the host n8n's own modules and calls them:
+
+- `@n8n/n8n-nodes-langchain` → `connectMcpClient`, `getAllTools`,
+  `mcpToolToDynamicTool`, `createCallTool` (the stock MCP Client Tool's helpers)
+- `@n8n/ai-utilities` → `logWrapper`
+- `n8n-core` → `StructuredToolkit`
+- `@langchain/core` → `DynamicStructuredTool` (indirectly, via the helpers above)
+
+The ONLY behavioural difference from the stock node is `getAuthHeaders` in
+`shared.ts`, which adds the `authPassthrough` expression-token mode.
+
+### Why reuse instead of reimplement — identity, and the `strict` crash
+
+The AI Agent (ToolsAgent) binds each tool to the model with LangChain's
+`convertToOpenAITool`:
+
+```js
+if (isLangChainTool(tool)) toolDef = { type: 'function', function: convertToOpenAIFunction(tool) };
+else                       toolDef = tool;
+if (fields?.strict !== undefined) toolDef.function.strict = fields.strict;
+```
+
+If our tool is not a recognised LangChain tool, `toolDef = tool` has no `.function`,
+so `toolDef.function.strict = ...` throws **`Cannot set properties of undefined
+(setting 'strict')`** — the error an earlier stub version of this node produced.
+`isLangChainTool` is duck-typed (needs `name` + a zod-v3 `schema`), and the tool is
+also invoked and unwrapped by the host. Separately, n8n-core's `getConnectedTools`
+unwraps the response with `if (toolOrToolkit instanceof StructuredToolkit)` — an
+`instanceof` check against the **host's** `n8n-core` class. Building the tools and the
+toolkit with the host's OWN classes satisfies all of this exactly, on every n8n
+release, with no shape drift.
+
+### Runtime requirement: NODE_PATH must include the host node_modules
+
+From a `N8N_CUSTOM_EXTENSIONS` (CUSTOM.*) node, bare specifiers like `n8n-core` or
+`@langchain/core` do NOT resolve by default — the global n8n install
+(`/usr/local/lib/node_modules/n8n/node_modules`) is not on the module search path.
+The deploy adds it to `NODE_PATH` (see `serve-n8n/docker-compose.yml`). Resolution of
+the stock helpers is upgrade-stable: the code resolves
+`@n8n/n8n-nodes-langchain/package.json` (bare, no pnpm hash) and joins the internal
+`dist/...` path as an absolute file path, bypassing the package `exports` map.
 
 ## Installation
 
@@ -64,9 +108,15 @@ npm test           # runs the test suite
 ## Build: this package MUST be bundled — do NOT revert to plain `tsc`
 
 The build (`npm run build`) uses **tsup** (esbuild) to compile the node into a
-**single, self-contained CommonJS file** with the Model Context Protocol SDK,
-`zod`, and `pkce-challenge` all **inlined**. This is deliberate and load-bearing.
-Do not "simplify" it back to `tsc` + a vendored `node_modules`.
+**single, self-contained CommonJS file** that ships with **no `node_modules`**. This
+is deliberate and load-bearing. Do not "simplify" it back to `tsc` + a vendored
+`node_modules`.
+
+The node has essentially no bundled runtime dependencies: everything it needs at
+runtime (the MCP SDK, LangChain, `n8n-core`, `@n8n/ai-utilities`) belongs to the
+**host** n8n and is resolved from there (see Architecture above and the `external`
+list in `tsup.config.ts`). So the bundle is tiny (~11 KB) and, critically, drops no
+dependency files into the mounted directory.
 
 ### Why (the n8n custom-extension loader defect)
 
@@ -112,24 +162,24 @@ internal file as a node class. n8n's own bundled MCP node is immune only because
 `n8n.nodes` array from `package.json` and loads **only those declared files** —
 never a recursive glob. Same dependency, different loader.
 
-### How bundling fixes it
+### How the current design fixes it
 
-Bundling produces **one** `*.node.js` file (our real node) and **no separate
-`pkce-challenge` module on disk** — the ESM source is transpiled and inlined into
-the bundle. There is nothing stray for the glob to match, so the loader only ever
-sees our node, whose class name matches its export. The `deploy.sh` in
-`serve-n8n` additionally deletes `node_modules` after the build and **hard-fails
-the deploy** if any `*.node.js` exists outside the one declared node file, so a
-future dependency that ships such a file can never silently reach n8n.
+The node ships as **one** `*.node.js` file (our real node) with **no `node_modules`
+at all** — every runtime dependency is resolved from the host (see Architecture),
+so there is nothing for the recursive glob to match except our node, whose class
+name matches its export. `deploy.sh` deletes `node_modules` after the build and
+**hard-fails the deploy** if any `*.node.js` exists outside the one declared node
+file, so a future dependency that ships such a file can never silently reach n8n.
 
-`n8n-workflow` is kept **external** (not bundled): the host container provides it,
-and n8n inspects some of its exports (`NodeConnectionTypes`, `NodeOperationError`)
-by identity, so a bundled copy would break those checks. Everything else is
-inlined.
+(Historically the crash was caused by a *vendored* `pkce-challenge/dist/index.node.js`
+— a transitive dependency of a bundled MCP SDK — being globbed as a bogus node.
+Reusing the host MCP machinery removed that dependency from the package entirely, so
+the crash surface is gone at the root, not just papered over.)
 
-> `zod` is pinned to `^3.25.0` (not the older `^3.23.8`) because the MCP SDK
-> `require`s the `zod/v4` subpath, which only exists in zod `>= 3.25.0`. An older
-> resolution would crash at runtime with `Cannot find module 'zod/v4'`.
+The `external` list in `tsup.config.ts` keeps `n8n-workflow`, `n8n-core`,
+`@langchain/core`, `@n8n/ai-utilities`, and `@n8n/n8n-nodes-langchain` unbundled: the
+host provides them and their class identity matters (`instanceof` /
+`isLangChainTool` checks), so a bundled copy would break tool attachment.
 
 ## License
 
