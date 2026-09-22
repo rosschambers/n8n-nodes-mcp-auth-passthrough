@@ -1,12 +1,15 @@
 import { NodeConnectionTypes, NodeOperationError } from 'n8n-workflow';
 import type {
+	IDataObject,
+	IExecuteFunctions,
+	INodeExecutionData,
 	INodeType,
 	INodeTypeDescription,
 	ISupplyDataFunctions,
 	SupplyData,
 } from 'n8n-workflow';
 
-import { getAuthHeaders, getNodeConfig, resolveHostMcpMachinery } from './shared';
+import { connectAndGetTools, getNodeConfig, resolveHostMcpMachinery } from './shared';
 
 export class McpClientToolAuthPassthrough implements INodeType {
 	description: INodeTypeDescription = {
@@ -144,27 +147,15 @@ export class McpClientToolAuthPassthrough implements INodeType {
 		// StructuredToolkit). Only the auth headers differ from the stock node.
 		const host = resolveHostMcpMachinery(this);
 
-		const { headers } = await getAuthHeaders(this, config.authentication, itemIndex);
+		const { client, mcpTools, error } = await connectAndGetTools(this, host, config, itemIndex);
 
-		const connection = await host.connectMcpClient({
-			serverTransport: config.serverTransport,
-			endpointUrl: config.endpointUrl,
-			headers,
-			name: node.type,
-			version: node.typeVersion,
-		});
-
-		if (!connection.ok) {
+		if (error) {
 			this.logger.error('McpClientToolAuthPassthrough: Failed to connect to MCP Server', {
-				error: connection.error,
+				error,
 			});
-			const mappedError = host.mapToNodeOperationError(node, connection.error);
-			this.addOutputData(NodeConnectionTypes.AiTool, itemIndex, mappedError);
-			throw mappedError;
+			this.addOutputData(NodeConnectionTypes.AiTool, itemIndex, error);
+			throw error;
 		}
-
-		const client = connection.result;
-		const mcpTools = await host.getAllTools(client);
 
 		if (!mcpTools?.length) {
 			const emptyError = new NodeOperationError(node, 'MCP Server returned no tools', {
@@ -186,11 +177,11 @@ export class McpClientToolAuthPassthrough implements INodeType {
 				host.mcpToolToDynamicTool(
 					tool,
 					host.createCallTool(tool.name, client, config.timeout, (errorMessage) => {
-						const error = new NodeOperationError(node, errorMessage, { itemIndex });
-						void this.addOutputData(NodeConnectionTypes.AiTool, itemIndex, error);
+						const callError = new NodeOperationError(node, errorMessage, { itemIndex });
+						void this.addOutputData(NodeConnectionTypes.AiTool, itemIndex, callError);
 						this.logger.error(
 							`McpClientToolAuthPassthrough: Tool "${tool.name}" failed to execute`,
-							{ error },
+							{ error: callError },
 						);
 					}),
 				),
@@ -203,8 +194,83 @@ export class McpClientToolAuthPassthrough implements INodeType {
 		return {
 			response: toolkit,
 			closeFunction: async () => {
-				await (client as { close: () => Promise<void> }).close();
+				await client!.close();
 			},
 		};
+	}
+
+	/**
+	 * Tool INVOCATION path (required in addition to supplyData).
+	 *
+	 * The AI Agent (ToolsAgent V3) does NOT call the toolkit tool's `func`
+	 * inline. When the LLM emits a tool call, the agent's `createEngineRequests`
+	 * turns it into an `ExecutionNodeAction` targeting this node
+	 * (`sourceNodeName`, type `ai_tool`); the engine sets `rewireOutputLogTo` and
+	 * runs the node via `runNode` — which requires an `execute` method. A node
+	 * with only `supplyData` throws
+	 * `The node "..." has a "supplyData" method but no "execute" method`.
+	 * The stock McpClientTool has BOTH methods; this mirrors its `execute`
+	 * exactly, reading the tool name from `item.json.tool` and the remaining keys
+	 * as arguments, then calling `client.callTool`.
+	 */
+	async execute(this: IExecuteFunctions): Promise<INodeExecutionData[][]> {
+		const node = this.getNode();
+		const items = this.getInputData();
+		const host = resolveHostMcpMachinery(this);
+		const returnData: INodeExecutionData[] = [];
+
+		for (let itemIndex = 0; itemIndex < items.length; itemIndex++) {
+			const item = items[itemIndex];
+			const config = getNodeConfig(this, itemIndex);
+			const { client, mcpTools, error } = await connectAndGetTools(this, host, config, itemIndex);
+
+			if (error) {
+				throw error;
+			}
+			if (!mcpTools?.length) {
+				throw new NodeOperationError(node, 'MCP Server returned no tools', { itemIndex });
+			}
+
+			try {
+				for (const tool of mcpTools) {
+					if (!item.json.tool || typeof item.json.tool !== 'string') {
+						throw new NodeOperationError(
+							node,
+							'Tool name not found in item.json.tool or item.tool',
+							{ itemIndex },
+						);
+					}
+					const toolName = item.json.tool;
+					if (toolName !== tool.name) {
+						continue;
+					}
+
+					const { tool: _toolName, ...toolArguments } = item.json;
+					const schema = tool.inputSchema;
+					const sanitizedToolArguments =
+						schema.additionalProperties !== true
+							? host.pick(
+									toolArguments as Record<string, unknown>,
+									Object.keys(schema.properties ?? {}),
+								)
+							: (toolArguments as Record<string, unknown>);
+
+					const result = await client!.callTool(
+						{ name: tool.name, arguments: sanitizedToolArguments as Record<string, unknown> },
+						host.CallToolResultSchema,
+						{ timeout: config.timeout },
+					);
+
+					returnData.push({
+						json: { response: result.content } as IDataObject,
+						pairedItem: { item: itemIndex },
+					});
+				}
+			} finally {
+				await client!.close();
+			}
+		}
+
+		return [returnData];
 	}
 }

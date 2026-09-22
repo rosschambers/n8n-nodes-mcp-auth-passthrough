@@ -2,7 +2,14 @@ import { createRequire } from 'node:module';
 import path from 'node:path';
 
 import { NodeOperationError } from 'n8n-workflow';
-import type { ISupplyDataFunctions } from 'n8n-workflow';
+import type { IExecuteFunctions, ISupplyDataFunctions } from 'n8n-workflow';
+
+/**
+ * Both call sites of the host resolver and config/auth helpers — supplyData
+ * (registration) and execute (invocation) — only ever call `getNode()` /
+ * `getNodeParameter()` / `getCredentials()`, which exist on both context types.
+ */
+type NodeContext = ISupplyDataFunctions | IExecuteFunctions;
 
 /**
  * Transport used to reach the MCP server. Mirrors the stock MCP Client Tool.
@@ -42,7 +49,7 @@ export interface HostMcpMachinery {
 		| { ok: true; result: unknown }
 		| { ok: false; error: { type: string; error: Error } }
 	>;
-	getAllTools: (client: unknown, cursor?: string) => Promise<Array<{ name: string; description?: string; inputSchema: unknown }>>;
+	getAllTools: (client: unknown, cursor?: string) => Promise<McpTool[]>;
 	mapToNodeOperationError: (node: unknown, error: { type: string; error: Error }) => NodeOperationError;
 	// from @n8n/n8n-nodes-langchain/dist/nodes/mcp/McpClientTool/utils.js
 	mcpToolToDynamicTool: (tool: unknown, onCallTool: (args: Record<string, unknown>) => Promise<unknown>) => unknown;
@@ -56,6 +63,39 @@ export interface HostMcpMachinery {
 	logWrapper: (tool: unknown, ctx: unknown) => unknown;
 	// from n8n-core
 	StructuredToolkit: new (tools: unknown[]) => unknown;
+	// from @modelcontextprotocol/sdk/types.js — the schema `execute()` passes to
+	// client.callTool (matches the stock node's execute path exactly).
+	CallToolResultSchema: unknown;
+	// lodash/pick — used by execute() to sanitise tool arguments against the
+	// tool's inputSchema, exactly like the stock node.
+	pick: <T extends Record<string, unknown>>(object: T, keys: string[]) => Partial<T>;
+}
+
+/**
+ * Minimal shape of an MCP tool descriptor as returned by getAllTools /
+ * client.listTools. `inputSchema` is a JSON schema object.
+ */
+export interface McpTool {
+	name: string;
+	description?: string;
+	inputSchema: {
+		additionalProperties?: boolean;
+		properties?: Record<string, unknown>;
+		[key: string]: unknown;
+	};
+}
+
+/**
+ * An MCP client, narrowed to the one method execute() needs. `callTool` matches
+ * the host SDK's signature: (params, resultSchema, options).
+ */
+export interface McpClient {
+	callTool: (
+		params: { name: string; arguments: Record<string, unknown> },
+		resultSchema: unknown,
+		options: { timeout: number },
+	) => Promise<{ content: unknown }>;
+	close: () => Promise<void>;
 }
 
 /**
@@ -96,7 +136,7 @@ export interface HostMcpMachinery {
  * README and serve-n8n docker-compose.yml). Without it these bare specifiers
  * do not resolve from a CUSTOM extension (verified).
  */
-export function resolveHostMcpMachinery(context: ISupplyDataFunctions): HostMcpMachinery {
+export function resolveHostMcpMachinery(context: NodeContext): HostMcpMachinery {
 	// Use a require anchored at this module so NODE_PATH / the host node_modules
 	// are consulted. `createRequire(import.meta.url)` is unavailable in the CJS
 	// bundle; anchor on the current file instead.
@@ -137,6 +177,10 @@ export function resolveHostMcpMachinery(context: ISupplyDataFunctions): HostMcpM
 		const { StructuredToolkit } = requireFromHere('n8n-core') as {
 			StructuredToolkit: HostMcpMachinery['StructuredToolkit'];
 		};
+		const { CallToolResultSchema } = requireFromHere('@modelcontextprotocol/sdk/types.js') as {
+			CallToolResultSchema: unknown;
+		};
+		const pick = requireFromHere('lodash/pick') as HostMcpMachinery['pick'];
 
 		return {
 			connectMcpClient: sharedUtils.connectMcpClient,
@@ -146,6 +190,8 @@ export function resolveHostMcpMachinery(context: ISupplyDataFunctions): HostMcpM
 			createCallTool: mcpUtils.createCallTool,
 			logWrapper,
 			StructuredToolkit,
+			CallToolResultSchema,
+			pick,
 		};
 	} catch (error) {
 		return fail(`Failed to load host MCP machinery: ${(error as Error).message}`);
@@ -157,7 +203,7 @@ export function resolveHostMcpMachinery(context: ISupplyDataFunctions): HostMcpM
  * configuration object used to connect to the MCP server.
  */
 export function getNodeConfig(
-	context: ISupplyDataFunctions,
+	context: NodeContext,
 	itemIndex: number,
 ): McpNodeConfig {
 	const authentication = context.getNodeParameter(
@@ -191,7 +237,7 @@ export function getNodeConfig(
  * the stock node's semantics.
  */
 export async function getAuthHeaders(
-	context: ISupplyDataFunctions,
+	context: NodeContext,
 	authentication: McpAuthenticationMode,
 	itemIndex: number,
 ): Promise<{ headers: Record<string, string> }> {
@@ -223,4 +269,46 @@ export async function getAuthHeaders(
 			return { headers: {} };
 		}
 	}
+}
+
+/**
+ * Result of connecting to the MCP server and listing its tools. Mirrors the
+ * stock node's `connectAndGetTools`.
+ */
+export interface ConnectAndGetToolsResult {
+	client: McpClient | null;
+	mcpTools: McpTool[] | null;
+	error: NodeOperationError | null;
+}
+
+/**
+ * Connect to the MCP server (using the host's transport code + our auth) and
+ * list its tools. Shared by BOTH `supplyData` (tool registration) and
+ * `execute` (tool invocation) so the two stay in lockstep, exactly like the
+ * stock node's private `connectAndGetTools`.
+ */
+export async function connectAndGetTools(
+	context: NodeContext,
+	host: HostMcpMachinery,
+	config: McpNodeConfig,
+	itemIndex: number,
+): Promise<ConnectAndGetToolsResult> {
+	const node = context.getNode();
+	const { headers } = await getAuthHeaders(context, config.authentication, itemIndex);
+
+	const connection = await host.connectMcpClient({
+		serverTransport: config.serverTransport,
+		endpointUrl: config.endpointUrl,
+		headers,
+		name: node.type,
+		version: node.typeVersion,
+	});
+
+	if (!connection.ok) {
+		return { client: null, mcpTools: null, error: host.mapToNodeOperationError(node, connection.error) };
+	}
+
+	const client = connection.result as McpClient;
+	const mcpTools = await host.getAllTools(client);
+	return { client, mcpTools, error: null };
 }

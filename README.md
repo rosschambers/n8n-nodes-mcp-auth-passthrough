@@ -54,24 +54,35 @@ loads the host n8n's own modules and calls them:
 The ONLY behavioural difference from the stock node is `getAuthHeaders` in
 `shared.ts`, which adds the `authPassthrough` expression-token mode.
 
-### Node classification: a native AI sub-node, NOT `usableAsTool`
+### Node classification: a native AI sub-node with BOTH `supplyData` AND `execute`
 
 The `description` mirrors the stock McpClientTool's classification: `group: ['output']`,
-`inputs: []`, `outputs: [{ type: AiTool, displayName: 'Tools' }]`, a `supplyData`
-method and NO `execute` method. Crucially it must **not** set `usableAsTool`.
+`inputs: []`, `outputs: [{ type: AiTool, displayName: 'Tools' }]`, and it must **not**
+set `usableAsTool` (that flag auto-generates a confusing `<name>Tool` wrapper via
+`convertNodeToAiTool`; the stock node does not use it, and neither do we). The node
+implements **both** `supplyData` and `execute` — mirroring the stock node exactly.
 
-`usableAsTool` is for regular ACTION nodes (with an `execute` method) that you also
-want exposed as a tool: at load time n8n's `convertNodeToAiTool` auto-generates a
-separate `<name>Tool` wrapper, and the agent drives that wrapper's tool through
-`createNodeAsTool` → the node's `execute`. A node that provides tools via
-`supplyData` and has no `execute` must not use that path. If it does, when the agent
-invokes the tool n8n calls `runNode` on it and throws
-`The node "..." has a "supplyData" method but no "execute" method`
-(n8n-core `workflow-execute` runNode). Dropping `usableAsTool` makes this a pure
-supplyData tool provider — the agent routes tool calls through the toolkit
-`supplyData` returns, and `runNode` is never called. The workflow references the node
-by its base type (`mcpClientToolAuthPassthrough`), exactly like the stock node; there
-is no `*Tool` variant to point at.
+Why both methods are needed — the AI Agent (ToolsAgent V3) uses a two-phase model:
+
+1. **Registration (supplyData):** at agent setup, `supplyData` returns a
+   `StructuredToolkit` of `DynamicStructuredTool`s. The agent reads each tool's
+   name/description/schema to tell the LLM what tools exist. (This is where the
+   `strict`/identity concerns below apply.)
+2. **Invocation (execute):** when the LLM emits a tool call, the agent does NOT call
+   the toolkit tool's `func` inline. `createEngineRequests`
+   (`@n8n/n8n-nodes-langchain/dist/utils/agent-execution/createEngineRequests.js`)
+   turns the tool call into an `ExecutionNodeAction` targeting this node
+   (`nodeName = tool.metadata.sourceNodeName`, type `ai_tool`). The engine
+   (`n8n-core requests-response.js`) then sets `node.rewireOutputLogTo = 'ai_tool'`
+   and RUNS the node via `runNode` (`n8n-core workflow-execute.js`), which requires an
+   `execute` method. A node with only `supplyData` throws
+   `The node "..." has a "supplyData" method but no "execute" method`.
+
+So `execute` is the real tool-call handler. It reads the tool name from
+`item.json.tool` and the remaining keys as arguments, sanitises them against the
+tool's `inputSchema`, and calls `client.callTool(...)` — identical to the stock
+node's `execute`, but with our `authPassthrough` bearer. The workflow references the
+node by its base type (`mcpClientToolAuthPassthrough`); there is no `*Tool` variant.
 
 ### Why reuse instead of reimplement — identity, and the `strict` crash
 
