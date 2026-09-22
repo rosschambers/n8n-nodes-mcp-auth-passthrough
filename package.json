@@ -1,0 +1,57 @@
+{
+  "name": "n8n-nodes-mcp-auth-passthrough",
+  "version": "0.1.0",
+  "description": "n8n community node providing an MCP Client Tool variant whose bearer token is resolved per-item from an expression, instead of a static credential.",
+  "keywords": [
+    "n8n-community-node-package",
+    "n8n",
+    "mcp",
+    "model-context-protocol",
+    "ai-agent"
+  ],
+  "license": "MIT",
+  "author": {
+    "name": "Ross Chambers"
+  },
+  "homepage": "https://github.com/rosschambers/n8n-nodes-mcp-auth-passthrough",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/rosschambers/n8n-nodes-mcp-auth-passthrough.git"
+  },
+  "main": "index.js",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "clean": "rimraf dist",
+    "prepublishOnly": "npm run build",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "files": [
+    "dist",
+    "index.js"
+  ],
+  "n8n": {
+    "n8nNodesApiVersion": 1,
+    "nodes": [
+      "dist/nodes/McpClientToolAuthPassthrough/McpClientToolAuthPassthrough.node.js"
+    ]
+  },
+  "engines": {
+    "node": ">=18.10"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.26.0",
+    "zod": "^3.23.8"
+  },
+  "peerDependencies": {
+    "n8n-workflow": "*"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.2",
+    "n8n-workflow": "^1.120.0",
+    "rimraf": "^6.0.1",
+    "typescript": "^5.5.4",
+    "vitest": "^2.1.1"
+  }
+}
